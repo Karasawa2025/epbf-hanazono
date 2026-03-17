@@ -1,0 +1,11 @@
+# Build artifacts
+ebpf-hide-proc
+*.o
+hideproc_bpfel.go
+hideproc_bpfel.o
+hideproc_bpfeb.go
+hideproc_bpfeb.o
+bpf/vmlinux.h
+
+# Go
+go.sum
